@@ -7,49 +7,82 @@ import android.util.Log
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.MotionEvent.ACTION_SCROLL
-import com.github.kittinunf.fuel.Fuel
-import com.google.gson.JsonParser
+import com.soywiz.klock.milliseconds
 import kotlinx.android.synthetic.main.activity_main.*
-import kotlinx.coroutines.GlobalScope
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
+import kotlinx.coroutines.*
+import nl.jolanrensen.kHomeAssistant.*
+import nl.jolanrensen.kHomeAssistant.core.KHomeAssistantInstance
+import nl.jolanrensen.kHomeAssistant.core.Mode
+import nl.jolanrensen.kHomeAssistant.domains.MediaPlayer
+import java.lang.Exception
+import java.lang.Math.floor
+import java.lang.Thread.MAX_PRIORITY
 import kotlin.concurrent.thread
+import kotlin.math.ceil
 import kotlin.math.floor
+import kotlin.math.roundToInt
 
 class MainActivity : WearableActivity() {
 
     /** Fill in these for yourself */
-    val HAUrl = "XXXXXX" // aka "https://yourserver.com"
-    val HAPassword = "XXXXXX"
-    val mediaPlayer = "XXXXXX" // the name of the media_player you want to control
-    val soundMode1 = "MOVIE" // sound_mode that is activated upon button 1 press
-    val soundMode2 = "MUSIC" // sound_mode that is activated upon button 2 press
+    private val kha = KHomeAssistantInstance(
+        host = "XXX", // TODO REMOVE
+        accessToken = "XXX",
+        port = 8123,
+        secure = true,
+        debug = true
+    )
 
-    @Volatile
-    var progress: Float = 0f
+    private var connectionJob: Thread? = null
 
-    @Volatile
-    var oldRoundedProgress: Int = 0 // 0 to 200
-    @Volatile
-    var roundedProgress: Int = 0 // 0 to 200
+    private val mediaPlayer: MediaPlayer.Entity = kha.MediaPlayer["denon_avrx2200w"]
 
-    @Volatile
-    var oldStereoVolume: Int = -1 // 0 to 200
+    private val soundMode1 = "MOVIE" // sound_mode that is activated upon button 1 press
+    private val soundMode2 = "MUSIC" // sound_mode that is activated upon button 2 press
 
-    @Volatile
-    var runThread = true
-    @Volatile
-    var calling = false
+    private var running = false
 
+    // In between 0 and 100
     @Volatile
-    var downloadingPaused = false
+    var progress: Float = -1f
 
-    @Volatile
-    var waitUntilDownload = 0
+    /** accepts values between 0 and 100, returns values between 0 and 1 with steps of 0.005 */
+    private fun Float.roundForStereo() = (
+            when {
+                this > 100f -> 100f
+                this < 0f -> 0f
+                else -> this
+            } * 2f
+            ).roundToInt() / 2f / 100f
 
-    fun pauseDownloading() {
-        if (!downloadingPaused) Log.d("HtmlCrown", "Downloading paused")
-        waitUntilDownload = 500
+
+    private val main: FunctionalAutomation = automation("initial") {
+        running = true
+        progress = mediaPlayer.volume_level * 100f
+
+        runEverySecond {
+            try {
+                val roundedProgress = progress.roundForStereo()
+                if (mediaPlayer.volume_level != roundedProgress)
+                    mediaPlayer.volume_level = roundedProgress
+            } catch (e: Exception) {
+            }
+            updateVisual()
+        }
+
+        updateVisual()
+    }
+
+    private fun updateVisual() = MainScope().launch {
+        try {
+            volume.isIndeterminate = false
+            volume.setProgress((mediaPlayer.volume_level * 100f).toInt(), true)
+            percent.text = "${mediaPlayer.volume_level * 100f}%"
+            progress = mediaPlayer.volume_level * 100f
+        } catch (e: Exception) {
+            volume.isIndeterminate = true
+            percent.text = "Device is off."
+        }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -62,137 +95,32 @@ class MainActivity : WearableActivity() {
         volume.isIndeterminate = true
         percent.text = "Loading..."
 
-        // pause download thread thread
-        GlobalScope.launch {
-            while (runThread) {
-                if (waitUntilDownload == 0) {
-                    if (downloadingPaused) {
-                        downloadingPaused = false
-                        Log.d("HtmlCrown", "Downloading resumed")
-                    }
-                }
-                if (!runThread) break
-                while (waitUntilDownload != 0) {
-                    downloadingPaused = true
-                    delay(1)
-                    waitUntilDownload--
-                    if (!runThread) break
-                }
-            }
-        }
-
-        // download thread
-        thread(start = true) {
-            while (runThread) {
-                if (!downloadingPaused) {
-                    if (!calling) {
-                        calling = true
-                        GlobalScope.launch {
-                            Fuel.get("$HAUrl/api/states/media_player.$mediaPlayer")
-                                .header("X-HA-Access" to HAPassword)
-                                .responseString { request, response, result ->
-                                    val (string, error) = result
-                                    if (error != null) {
-                                        Log.e("HtmlCrown", error.toString())
-                                        return@responseString
-                                    }
-                                    val json = JsonParser().parse(string).asJsonObject
-                                    if (json["state"].asString == "off") {
-                                        oldStereoVolume = -1
-                                        runOnUiThread {
-                                            volume.isIndeterminate = true
-                                            percent.text = "Device is off"
-                                        }
-                                    } else {
-                                        val rawVolumeStereo =
-                                            json["attributes"].asJsonObject["volume_level"].asDouble.toFloat() * 100f
-                                        val volumeStereo = floor(rawVolumeStereo * 2f).toInt()
-                                        if (volumeStereo != oldStereoVolume) {
-                                            oldStereoVolume = volumeStereo
-                                            Log.d(
-                                                "HtmlCrown",
-                                                "Read device volume as ${volumeStereo / 2.0}"
-                                            )
-
-                                            roundedProgress = volumeStereo
-                                            oldRoundedProgress = roundedProgress
-                                            progress = roundedProgress / 2f
-                                            runOnUiThread {
-                                                percent.text = "${roundedProgress / 2.0}%"
-                                                volume.isIndeterminate = false
-                                                volume.progress = roundedProgress / 2
-                                            }
-                                        }
-                                    }
-                                    calling = false
-                                }
-                        }
-                    }
-                }
-            }
-        }
-
-        // upload thread
-        thread(start = true) {
-            while (runThread) {
-                if (!calling) {
-                    if (oldRoundedProgress != roundedProgress) { // if we changed volume locally
-                        oldRoundedProgress = roundedProgress
-                        calling = true
-                        pauseDownloading()
-                        GlobalScope.launch {
-                            Fuel.post("$HAUrl/api/services/media_player/volume_set")
-                                .header("X-HA-Access" to HAPassword)
-                                .jsonBody(
-                                    jsonObjectOf(
-                                        "entity_id" to "media_player.$mediaPlayer",
-                                        "volume_level" to "${roundedProgress / 200.0}"
-                                    ).toString()
-                                )
-                                .response { request, response, result ->
-                                    //Log.d("HtmlCrown", "request: $request\nresponse: $response")
-                                    val (bytes, error) = result
-                                    if (bytes != null) {
-                                        //Log.d("HtmlCrown", String(bytes))
-                                    }
-                                    Log.d(
-                                        "HtmlCrown",
-                                        "Set volume of device to ${roundedProgress / 2.0}"
-                                    )
-                                    calling = false
-                                }
-                        }
-                    }
-                }
+        connectionJob = thread(priority = MAX_PRIORITY) {
+            runBlocking {
+                kha.run(main, mode = Mode.KEEP_RUNNING)
             }
         }
     }
 
     override fun onDestroy() {
-        runThread = false
+        running = false
+        connectionJob?.stop()
         super.onDestroy()
     }
 
     override fun onGenericMotionEvent(event: MotionEvent): Boolean {
+        if (!running) return true
         if (event.action == ACTION_SCROLL && RotaryEncoder.isFromRotaryEncoder(event)) {
-            pauseDownloading()
-            val delta =
-                (-RotaryEncoder.getRotaryAxisValue(event) * RotaryEncoder.getScaledScrollFactor(
-                    applicationContext
-                )) / 50
+            val delta = (
+                    -RotaryEncoder.getRotaryAxisValue(event)
+                            * RotaryEncoder.getScaledScrollFactor(applicationContext)
+                    ) / 50
 
             progress += delta
             if (progress > 100f) progress = 100f
             if (progress < 0f) progress = 0f
 
-            val oldRoundedProcess = roundedProgress
-            roundedProgress = floor(progress * 2).toInt()
-
-            if (oldRoundedProcess != roundedProgress) {
-                percent.text = "${roundedProgress / 2.0}%"
-                volume.progress = roundedProgress / 2
-            }
-
+            Log.d("HtmlCrown", "new progress is ${progress.roundForStereo()}")
             return true
         }
         return false
@@ -200,86 +128,35 @@ class MainActivity : WearableActivity() {
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent) =
         if (event.repeatCount == 0) {
-            when (keyCode) {
+            if (!running) super.onKeyDown(keyCode, event)
+            else when (keyCode) {
                 KeyEvent.KEYCODE_STEM_1 -> {
                     Log.d("HtmlCrown", "1 pressed")
-                    GlobalScope.launch {
-                        Fuel.post("$HAUrl/api/services/media_player/select_sound_mode")
-                            .header("X-HA-Access" to HAPassword)
-                            .jsonBody(
-                                jsonObjectOf(
-                                    "entity_id" to "media_player.$mediaPlayer",
-                                    "sound_mode" to soundMode1
-                                ).toString()
-                            )
-                            .response { request, response, result ->
-                                //Log.d("HtmlCrown", "request: $request\nresponse: $response")
-                                val (bytes, error) = result
-                                if (bytes != null) {
-                                    //Log.d("HtmlCrown", String(bytes))
-                                }
-                            }
+                    runBlocking {
+                        mediaPlayer.sound_mode = soundMode1
                     }
                     true
                 }
                 KeyEvent.KEYCODE_STEM_2 -> {
                     Log.d("HtmlCrown", "2 pressed")
-                    GlobalScope.launch {
-                        Fuel.post("$HAUrl/api/services/media_player/select_sound_mode")
-                            .header("X-HA-Access" to HAPassword)
-                            .jsonBody(
-                                jsonObjectOf(
-                                    "entity_id" to "media_player.$mediaPlayer",
-                                    "sound_mode" to soundMode2
-                                ).toString()
-                            )
-                            .response { request, response, result ->
-                                //Log.d("HtmlCrown", "request: $request\nresponse: $response")
-                                val (bytes, error) = result
-                                if (bytes != null) {
-                                    //Log.d("HtmlCrown", String(bytes))
-                                }
-                            }
+                    runBlocking {
+                        mediaPlayer.sound_mode = soundMode2
                     }
                     true
                 }
                 KeyEvent.KEYCODE_NAVIGATE_NEXT -> {
                     Log.d("HtmlCrown", "Wrist flick out")
-                    GlobalScope.launch {
-                        Fuel.post("$HAUrl/api/services/media_player/turn_off")
-                            .header("X-HA-Access" to HAPassword)
-                            .jsonBody(
-                                jsonObjectOf(
-                                    "entity_id" to "media_player.$mediaPlayer"
-                                ).toString()
-                            )
-                            .response { request, response, result ->
-                                //Log.d("HtmlCrown", "request: $request\nresponse: $response")
-                                val (bytes, error) = result
-                                if (bytes != null) {
-                                    //Log.d("HtmlCrown", String(bytes))
-                                }
-                            }
+                    runBlocking {
+                        mediaPlayer.turnOff()
+                        updateVisual()
                     }
                     true
                 }
                 KeyEvent.KEYCODE_NAVIGATE_PREVIOUS -> {
                     Log.d("HtmlCrown", "Wrist flick in")
-                    GlobalScope.launch {
-                        Fuel.post("$HAUrl/api/services/media_player/turn_on")
-                            .header("X-HA-Access" to HAPassword)
-                            .jsonBody(
-                                jsonObjectOf(
-                                    "entity_id" to "media_player.$mediaPlayer"
-                                ).toString()
-                            )
-                            .response { request, response, result ->
-                                //Log.d("HtmlCrown", "request: $request\nresponse: $response")
-                                val (bytes, error) = result
-                                if (bytes != null) {
-                                    //Log.d("HtmlCrown", String(bytes))
-                                }
-                            }
+                    runBlocking {
+                        mediaPlayer.turnOn()
+                        updateVisual()
                     }
                     true
                 }
